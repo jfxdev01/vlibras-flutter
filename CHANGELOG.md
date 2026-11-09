@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Tradução: o endpoint padrão `https://traducao2.vlibras.gov.br/dl/translate` passou a responder 401 a qualquer chamada, e o avatar só soletrava o texto cru (plurais, verbos e nomes saíam letra por letra). O padrão agora é `https://traducao2.vlibras.gov.br/translate`, o mesmo do widget oficial do gov.br. A resposta em JSON `{"traducao": "..."}` também é aceita.
+- Tradução: o tradutor do governo responde 500 "Translation Core Unavailable" em parte das chamadas (cerca de 1 em 10 numa medição) e acerta na seguinte. Erros 5xx e de rede agora são repetidos até duas vezes (após 0,4 s e 1,2 s), dentro do limite de 30 s, antes de cair na soletração do texto.
 - Web: o `translateUrl` do controller chegava à plataforma web e era descartado; agora é repassado ao player.
 - Android: quando o sistema encerrava o processo de renderização do WebView (falta de memória, por exemplo), o app inteiro era encerrado junto, porque o `webview_flutter` não trata `onRenderProcessGone`. O plugin Android passa a tratar o evento (Android 8.0+), e o `VLibrasAccessibilityWidget` recria o avatar, uma vez sozinho e depois pelo botão "Tentar novamente".
 - Com o painel aberto, a tela voltou a rolar (listas, sliders, `PageView`): o interceptor de toques ficou translúcido. O primeiro toque continua só traduzindo, e o segundo toque perto dele aciona o elemento com o toque real, sem evento sintético. Rolar a tela desarma o toque armado.

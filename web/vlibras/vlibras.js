@@ -1422,23 +1422,39 @@
 	    callback(undefined, 'timeout_error');
 	  }, time);
 
-	  request.post(this.endpoint, { text: text, domain: domain }).end(
-	    function (err, response) {
-	      if (hasTimeout) return;
+	  // O tradutor do governo às vezes responde 500 "Translation Core
+	  // Unavailable" e acerta na chamada seguinte. Sem tentar de novo, o player
+	  // cai na soletração do texto cru. Erros de rede (sem status) também valem.
+	  const retryDelays = [400, 1200];
+	  const endpoint = this.endpoint;
 
-	      clearTimeout(timeout);
-	      if (err) return callback(undefined, err);
+	  const attempt = function (n) {
+	    request.post(endpoint, { text: text, domain: domain }).end(
+	      function (err, response) {
+	        if (hasTimeout) return;
 
-	      // O endpoint /translate responde a glosa em texto puro, mas o widget
-	      // oficial também aceita JSON no formato {"traducao": "..."}.
-	      var gloss = response.text;
-	      try {
-	        var parsed = JSON.parse(gloss);
-	        if (parsed && typeof parsed.traducao === 'string') gloss = parsed.traducao;
-	      } catch (e) {}
-	      callback(gloss);
-	    }
-	  );
+	        const status = (err && err.status) || 0;
+	        if (err && (status === 0 || status >= 500) && n < retryDelays.length) {
+	          setTimeout(function () { attempt(n + 1); }, retryDelays[n]);
+	          return;
+	        }
+
+	        clearTimeout(timeout);
+	        if (err) return callback(undefined, err);
+
+	        // O endpoint /translate responde a glosa em texto puro, mas o widget
+	        // oficial também aceita JSON no formato {"traducao": "..."}.
+	        var gloss = response.text;
+	        try {
+	          var parsed = JSON.parse(gloss);
+	          if (parsed && typeof parsed.traducao === 'string') gloss = parsed.traducao;
+	        } catch (e) {}
+	        callback(gloss);
+	      }
+	    );
+	  };
+
+	  attempt(0);
 	};
 
 	module.exports = GlosaTranslator;
