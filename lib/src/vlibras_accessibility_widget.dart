@@ -167,7 +167,7 @@ class VLibrasAccessibilityWidget extends StatefulWidget {
   final VLibrasSettingsLabels settingsLabels;
 
   /// Custom translation API endpoint. When null the default VLibras endpoint
-  /// (`https://traducao2.vlibras.gov.br/dl/translate`) is used.
+  /// (`https://traducao2.vlibras.gov.br/translate`) is used.
   final String? translateUrl;
 
   /// Gradient applied to the background of the collapsed floating button.

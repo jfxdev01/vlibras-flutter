@@ -1278,7 +1278,7 @@
 /* 9 */
 /***/ (function(module, exports) {
 
-	exports.translatorUrl = 'https://traducao2.vlibras.gov.br/dl/translate';
+	exports.translatorUrl = 'https://traducao2.vlibras.gov.br/translate';
 	exports.dictionaryUrl = 'https://dicionario2.vlibras.gov.br/2018.3.1/WEBGL/';
 	exports.dictionaryStaticUrl = 'https://dicionario2.vlibras.gov.br/static/BUNDLES/2018.3.1/WEBGL/';
 
@@ -1436,8 +1436,16 @@
 	      if (hasTimeout) return;
 
 	      clearTimeout(timeout);
-	      if (err) callback(undefined, err);
-	      else callback(response.text);
+	      if (err) return callback(undefined, err);
+
+	      // O endpoint /translate responde a glosa em texto puro, mas o widget
+	      // oficial também aceita JSON no formato {"traducao": "..."}.
+	      var gloss = response.text;
+	      try {
+	        var parsed = JSON.parse(gloss);
+	        if (parsed && typeof parsed.traducao === 'string') gloss = parsed.traducao;
+	      } catch (e) {}
+	      callback(gloss);
 	    }
 	  );
 	};
