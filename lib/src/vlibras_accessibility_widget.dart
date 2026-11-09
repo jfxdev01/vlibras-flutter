@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'vlibras_controller.dart';
+import 'vlibras_settings.dart';
 import 'vlibras_settings_labels.dart';
 import 'vlibras_settings_panel.dart';
 import 'vlibras_view.dart';
@@ -28,6 +29,11 @@ const double _kDockVerticalMargin = 8.0;
 // it damps the gesture so resizing feels calm and controllable instead of
 // jumpy. 1.0 would track the fingers 1:1.
 const double _kPinchSensitivity = 0.6;
+
+// Quantas vezes seguidas o avatar é recriado sozinho depois de um erro (ex.:
+// o Android encerrou o renderer do WebView). Passou disso, o painel mostra o
+// erro com o botão de tentar de novo, para não entrar em laço.
+const int _kMaxAutoRecoveries = 1;
 
 enum _VLibrasDockSide { left, right }
 
@@ -116,6 +122,9 @@ class VLibrasAccessibilityWidget extends StatefulWidget {
     this.buttonIconGradient,
     this.minAvatarScale = 0.7,
     this.maxAvatarScale = 2.5,
+    this.preloadAvatar = false,
+    this.releaseAvatarWhenInBackground = true,
+    this.controllerFactory,
   }) : assert(
          minAvatarScale > 0 && minAvatarScale <= maxAvatarScale,
          'minAvatarScale must be > 0 and <= maxAvatarScale',
@@ -184,14 +193,43 @@ class VLibrasAccessibilityWidget extends StatefulWidget {
   /// ```
   final Gradient? buttonIconGradient;
 
+  /// Quando `true`, o avatar começa a carregar assim que o widget é montado,
+  /// como antes da 0.5.0, e o primeiro toque no botão já o encontra pronto.
+  ///
+  /// O padrão (`false`) só carrega o avatar quando o painel é aberto pela
+  /// primeira vez. O player Unity ocupa centenas de MB no processo do WebView,
+  /// e carregá-lo na abertura do app cobra essa memória de todo usuário, mesmo
+  /// de quem nunca usa o VLibras.
+  final bool preloadAvatar;
+
+  /// Quando `true` (padrão), o avatar é descarregado se o app for para segundo
+  /// plano com o painel fechado, e volta a carregar na próxima abertura.
+  ///
+  /// Em segundo plano, o Android escolhe o que encerrar pela memória ocupada, e
+  /// o renderer com o player Unity costuma ser o maior alvo. Velocidade, avatar
+  /// e legendas escolhidos pelo usuário são mantidos.
+  final bool releaseAvatarWhenInBackground;
+
+  /// Cria o controller usado pelo widget. Recebe as preferências a restaurar
+  /// (ou `null` na primeira vez). Exposto para testes.
+  @visibleForTesting
+  final VLibrasController Function(VLibrasSettings? initialSettings)?
+      controllerFactory;
+
   @override
   State<VLibrasAccessibilityWidget> createState() =>
       _VLibrasAccessibilityWidgetState();
 }
 
-class _VLibrasAccessibilityWidgetState
-    extends State<VLibrasAccessibilityWidget> {
-  late final VLibrasController _controller;
+class _VLibrasAccessibilityWidgetState extends State<VLibrasAccessibilityWidget>
+    with WidgetsBindingObserver {
+  // Criado na primeira abertura do painel (ou já no initState com
+  // preloadAvatar) e descartado ao liberar o avatar.
+  VLibrasController? _controller;
+  // Preferências do último controller descartado, para o próximo herdar.
+  VLibrasSettings? _savedSettings;
+  VLibrasStatus? _lastStatus;
+  int _autoRecoveries = 0;
   bool _isExpanded = false;
   bool _isSettingsOpen = false;
   bool _isAvatarPickerOpen = false;
@@ -226,10 +264,12 @@ class _VLibrasAccessibilityWidgetState
   @override
   void initState() {
     super.initState();
-    _controller = VLibrasController(translateUrl: widget.translateUrl);
-    WidgetsBinding.instance.addPostFrameCallback(
-      (_) => _controller.initialize(),
-    );
+    WidgetsBinding.instance.addObserver(this);
+    if (widget.preloadAvatar) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _ensureController().initialize();
+      });
+    }
   }
 
   @override
@@ -248,8 +288,93 @@ class _VLibrasAccessibilityWidgetState
 
   @override
   void dispose() {
-    _controller.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _releaseController();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.paused:
+        if (!_isExpanded && widget.releaseAvatarWhenInBackground) {
+          _releaseController();
+        }
+      case AppLifecycleState.resumed:
+        if (widget.preloadAvatar && widget.visible && _controller == null) {
+          _ensureController().initialize();
+        }
+      default:
+        break;
+    }
+  }
+
+  // ── Controller lifecycle ──────────────────────────────────────────────────
+  VLibrasController _ensureController() {
+    final existing = _controller;
+    if (existing != null) return existing;
+
+    final settings = _savedSettings;
+    final controller = widget.controllerFactory?.call(settings) ??
+        VLibrasController(
+          translateUrl: widget.translateUrl,
+          initialSettings: settings,
+        );
+    controller.addListener(_onControllerChanged);
+    _lastStatus = controller.value.status;
+    return _controller = controller;
+  }
+
+  // Descarta o controller (e com ele o WebView), guardando as preferências.
+  void _releaseController() {
+    final controller = _controller;
+    if (controller == null) return;
+    final value = controller.value;
+    _savedSettings = VLibrasSettings(
+      speed: value.speed,
+      avatar: value.avatar,
+      subtitlesEnabled: value.subtitlesEnabled,
+    );
+    controller.removeListener(_onControllerChanged);
+    _controller = null;
+    _lastStatus = null;
+    controller.dispose();
+  }
+
+  // Troca o controller por um novo e, com o painel aberto, já o carrega.
+  void _recreateController() {
+    setState(_releaseController);
+    if (_isExpanded) _ensureController().initialize();
+  }
+
+  void _onControllerChanged() {
+    final controller = _controller;
+    if (controller == null) return;
+    final status = controller.value.status;
+    if (status == VLibrasStatus.ready) _autoRecoveries = 0;
+
+    final enteredError =
+        status == VLibrasStatus.error && _lastStatus != VLibrasStatus.error;
+    _lastStatus = status;
+    if (!enteredError || _autoRecoveries >= _kMaxAutoRecoveries) return;
+
+    // O WebView pode ter perdido o renderer (o Android o encerra quando falta
+    // memória). Recria uma vez sozinho, fora da notificação em andamento.
+    _autoRecoveries++;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && identical(_controller, controller)) _recreateController();
+    });
+  }
+
+  void _expand() {
+    final current = _controller;
+    if (current != null && current.value.status == VLibrasStatus.error) {
+      _autoRecoveries = 0;
+      _releaseController();
+    }
+    final controller = _ensureController();
+    setState(() => _isExpanded = true);
+    controller.initialize();
   }
 
   // ── Pending-tap helpers ───────────────────────────────────────────────────
@@ -316,7 +441,7 @@ class _VLibrasAccessibilityWidgetState
               .toPlainText(includeSemanticsLabels: false)
               .trim();
           if (text.isEmpty) continue;
-          _controller.translate(text);
+          _controller?.translate(text);
           break;
         }
       }
@@ -567,7 +692,7 @@ class _VLibrasAccessibilityWidgetState
               bottomLeft: Radius.circular(8),
             ),
             child: InkWell(
-              onTap: () => setState(() => _isExpanded = true),
+              onTap: _expand,
               borderRadius: const BorderRadius.only(
                 topLeft: Radius.circular(8),
                 bottomLeft: Radius.circular(8),
@@ -662,7 +787,7 @@ class _VLibrasAccessibilityWidgetState
       width: rect.width,
       height: rect.height,
       child: GestureDetector(
-        onTap: () => setState(() => _isExpanded = true),
+        onTap: _expand,
         onPanStart: (_) => _startDrag(viewport, padding, buttonExtent),
         onPanUpdate: (details) =>
             _updateDrag(details, viewport, padding, buttonExtent),
@@ -872,7 +997,7 @@ class _VLibrasAccessibilityWidgetState
       child: Material(
         color: widget.primaryColor,
         child: VLibrasSettingsPanel(
-          controller: _controller,
+          controller: _controller!,
           labels: widget.settingsLabels,
           onClose: () => setState(() => _isSettingsOpen = false),
         ),
@@ -923,7 +1048,7 @@ class _VLibrasAccessibilityWidgetState
                     isSelected: false,
                     primaryColor: widget.primaryColor,
                     onTap: () {
-                      _controller.setAvatar(others[0]);
+                      _controller?.setAvatar(others[0]);
                       setState(() => _isAvatarPickerOpen = false);
                     },
                   ),
@@ -933,7 +1058,7 @@ class _VLibrasAccessibilityWidgetState
                     isSelected: false,
                     primaryColor: widget.primaryColor,
                     onTap: () {
-                      _controller.setAvatar(others[1]);
+                      _controller?.setAvatar(others[1]);
                       setState(() => _isAvatarPickerOpen = false);
                     },
                   ),
@@ -953,7 +1078,12 @@ class _VLibrasAccessibilityWidgetState
       children: [
         ColoredBox(
           color: _kAvatarBg,
-          child: VLibrasView(controller: _controller),
+          // A chave força um WebView novo quando o controller é recriado: o
+          // anterior pode ter perdido o renderer e não serve mais.
+          child: VLibrasView(
+            key: ObjectKey(_controller),
+            controller: _controller!,
+          ),
         ),
 
         if (isLoading)
@@ -980,10 +1110,29 @@ class _VLibrasAccessibilityWidgetState
             child: Center(
               child: Padding(
                 padding: const EdgeInsets.all(16),
-                child: Text(
-                  value.error ?? 'Erro ao carregar',
-                  style: const TextStyle(color: Colors.redAccent, fontSize: 12),
-                  textAlign: TextAlign.center,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      value.error ?? 'Erro ao carregar',
+                      style: const TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 12,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      onPressed: () {
+                        _autoRecoveries = 0;
+                        _recreateController();
+                      },
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white,
+                      ),
+                      child: Text(widget.settingsLabels.retry),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -1033,7 +1182,7 @@ class _VLibrasAccessibilityWidgetState
                 max: 2,
                 divisions: 2,
                 label: _speedLabel(value.speed),
-                onChanged: (v) => _controller.setSpeed(_sliderToSpeed(v)),
+                onChanged: (v) => _controller?.setSpeed(_sliderToSpeed(v)),
               ),
             ),
           ),
@@ -1076,12 +1225,14 @@ class _VLibrasAccessibilityWidgetState
           ),
 
         // ④ VLibras panel / button — topmost, handles its own taps first.
-        ValueListenableBuilder<VLibrasValue>(
-          valueListenable: _controller,
-          builder: (context, value, __) => _isExpanded
-              ? _buildDraggableAvatarPanel(context, value)
-              : _buildDraggableFloatingButton(),
-        ),
+        if (_isExpanded && _controller != null)
+          ValueListenableBuilder<VLibrasValue>(
+            valueListenable: _controller!,
+            builder: (context, value, __) =>
+                _buildDraggableAvatarPanel(context, value),
+          )
+        else
+          _buildDraggableFloatingButton(),
       ],
     );
   }
